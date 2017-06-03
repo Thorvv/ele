@@ -1,0 +1,83 @@
+1.账户信息表
+user_info
+	userid 自增 用户id 
+	status 用户状态 
+	token 令牌
+	token_invalid_time 登录有效时间
+	headurl 用户头像
+	nickname 用户昵称
+	register_ip 注册ip 
+	create_time 注册时间
+
+2. 用户授权信息表 
+user_auths
+	id 自增
+	userid 用户id
+	identity_type 微信 qq 微博 手机 用户名等登陆方式
+	openid 第三方唯一标识或手机号用户名
+	credential 对应密码，第三方则不保存（加密）
+
+3. 登陆记录表
+login_record 
+	id 自增
+	userid 用户id
+	login_time 最后登入时间
+	logout_time 最后登出时间
+	login_ip 最后登陆ip
+
+4. 用户安全设置
+user_secure
+	id 自增
+	userid 用户id
+	pay_passwd 支付密码（加密）
+
+
+5. 虚拟商品配置表
+goods_config
+	id 自增
+	goods_id 商品id
+	use_money 购买所需金额
+	goods_type 商品类型 （例如：1:霸王餐券 2:红包 3:会员）
+	goods_detail 商品描述 （例如：20元无门槛霸王餐券）
+
+6. 霸王餐券购买纪录日志表
+ticked_recode
+	period 霸王餐期号
+	goods_id 商品id 
+	userid 用户id
+	ticketid 奖券号 
+	success_time 完成支付时间
+
+7. 霸王餐中奖纪录表
+lottery_record
+	id 自增
+	period 霸王餐期号
+	userid 用户id
+	ticketid 中奖号 
+	goods_id 商品id 
+
+8. 用户红包获取纪录
+	id 自增
+	userid 用户id
+	goods_id 商品id 
+
+
+实现思路：分为2大部分框架结构
+1. web server
+1.1 接收客户端参加活动的http请求并发送到rabbitmq消息队列，使用公平分发机制
+1.2 利用nginx反向代理（集群多服务器负载均衡）
+1.3 使用uwsgi＋gevent＋flask 利用uwsgi开启多进程，gevent协程框架处理高并发请求（此设计适合io密集型）
+
+2. 数据处理及序列化（分为三个模块，维护list，处理rabbitmq消息队列写redis，开奖）
+2.1 使用multiprocessing多进程（此设计适合cpu计算密集型）
+2.2 使用multiprocessing中的Manager维护一个进程间共享的list链表，设计为[{'period': 1, 'length': 0}, {'period': 2, 'length': 0}]
+2.2.1 period为每期霸王餐活动的期号，length为本期已被购买的券数
+2.2.2 设计目的：同一用户可一次购买多张，数量可能大于本期剩余票数，为保障一次买多张增加中奖率的理念，将此用户整体排入下一期
+2.3 部分进程做list的插入操作（list超过一定长度则continue），让期号自增，插入时用manager的lock锁住
+2.4 部分进程处理rabbitmq的消息队列，同时轮询维护的list进行写redis操作
+2.4.1 为保障早生成的期号优先处理，length＋购买票数< 设定的n时，首先在list头部插入该期的数据，修改length，后删除原来的该期数据
+2.4.2 将数据实时写入redis，避免频繁写mysql引起的磁盘io降低并发能力，并发送红包到用户账户
+2.4.3 设计为redis的hash结构，hmset(success_time, {'period': period_dict['period'], 'userid': userid, 'ticketid': ticketid} （若同用户多张券则在time后添加索引）
+2.4.4 完成写redis后发送basic_ack到rabbitmq，若写redis操作失败或维护的list没有数据，则回复basic_reject，将数据交给下一个进程处理，保障了数据不会丢失
+2.5 部分进程处理开奖，轮训维护的list，如果其中length等于设置的n，则该期开奖，生成中奖号，写入redis，从list中删除该数据，并发送霸王券红包奖励
+2.6 夜间并发量小时读redis写mysql
